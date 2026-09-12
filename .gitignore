@@ -1,0 +1,10 @@
+log.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Packaged submission artifact (rebuilt on demand, not source)
+code.zip
