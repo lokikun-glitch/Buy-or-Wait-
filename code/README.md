@@ -108,6 +108,13 @@ code/
   `stop:`/`reduce_to:` references are always that user's latest occurrence
   of the category) and reduce to exactly `minimum_allowed_amount` when
   reducing, matching the supplied sample outputs.
+- **Spending changes are not exclusive to `full_payment`.** They exist to
+  keep the 90-day forecast safe, independent of which method pays -- so an
+  `installments` schedule that's short of safe by itself is retried with up
+  to 3 minimal flexible-spending changes (`find_minimal_changes_for_payments`
+  in `spending_changes.py`) rather than being discarded outright. The
+  installment amounts/dates themselves never change; only the surrounding
+  forecast does.
 - **Deadline compliance is a hard eligibility gate, not just a ranking
   preference**, for every method except `wait`: "the plan must complete the
   request by desired_completion_date" (90-Day Safety Check) is part of what

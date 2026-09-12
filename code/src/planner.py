@@ -25,7 +25,7 @@ from .simulator import (
     is_amount_safe_on_date,
     min_balance_with_payments,
 )
-from .spending_changes import find_minimal_changes
+from .spending_changes import find_minimal_changes, find_minimal_changes_for_payments
 
 TIER_NOW = 0
 TIER_WITH_PLAN = 1
@@ -135,7 +135,12 @@ def build_plan(
             )
         )
 
-    # 3. Installments (must exactly match a supplied option).
+    # 3. Installments (must exactly match a supplied option). The schedule
+    #    itself is fixed by the option regardless of spending changes, so if
+    #    the plain schedule isn't safe, trying it again with up to 3 minimal
+    #    flexible-spending changes is a well-defined fallback -- spending
+    #    changes keep the 90-day forecast safe independent of which method is
+    #    paying, they are not exclusive to full_payment.
     max_months = profile.get("max_installment_months")
     has_max_months = max_months is not None and not (isinstance(max_months, float) and pd.isna(max_months))
     if "installments" in accepted and has_max_months:
@@ -149,6 +154,15 @@ def build_plan(
                         "installments", TIER_WITH_PLAN, opt.schedule, payment_option_id=opt.payment_option_id
                     )
                 )
+            else:
+                opt_changes = find_minimal_changes_for_payments(forecast, opt.schedule)
+                if opt_changes:
+                    candidates.append(
+                        Candidate(
+                            "installments", TIER_WITH_PLAN, opt.schedule,
+                            changes=opt_changes, payment_option_id=opt.payment_option_id,
+                        )
+                    )
 
     # 4. Full payment today with flexible spending changes (only tried if
     #    plain full payment today isn't already safe).

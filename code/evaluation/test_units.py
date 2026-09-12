@@ -265,6 +265,35 @@ def test_verifier_rejects_fabricated_installment_plan():
     check(f"verifier: accepts an installment schedule that matches a supplied option ({problems2})", ok2)
 
 
+def test_installments_combine_with_spending_changes():
+    # An installment schedule that's short of safe by itself should be
+    # rescued by a minimal flexible-spending change, exactly like
+    # full_payment already is -- spending changes keep the 90-day forecast
+    # safe regardless of which method is paying, per the problem statement.
+    from src.spending_changes import find_minimal_changes_for_payments
+    from datetime import timedelta
+
+    # Two installments of 400 each (800 total) plus an unrelated 150 dining
+    # charge land the balance at 700 -- 100 short of the 800 minimum.
+    # Stopping the 150 dining charge alone recovers exactly to 850, safe.
+    dining = ForecastItem(date(2026, 1, 20), -150.0, "dining", "series:dining", "projected", can_stop=True, anchor_event_id="event_1")
+    fc = UserForecast(
+        user_id="test", request_date=date(2026, 1, 1), horizon_end=date(2026, 1, 1) + __import__("datetime").timedelta(days=90),
+        home_currency="USD", starting_balance=1650.0, minimum_balance=800.0, items=[dining],
+        change_options=[SpendingChangeOption("series:dining", "dining", "event_1", "stop", None, 150.0)],
+    )
+    schedule = [(date(2026, 1, 5), 400.0), (date(2026, 2, 4), 400.0)]
+    from src.simulator import min_balance_with_payments
+    without_changes = min_balance_with_payments(fc, schedule)
+    check("installments+changes: plain schedule is unsafe (700 < 800 minimum)", without_changes < fc.minimum_balance)
+
+    changes = find_minimal_changes_for_payments(fc, schedule)
+    check("installments+changes: a minimal change is found", changes is not None and len(changes) == 1)
+    if changes:
+        with_changes = min_balance_with_payments(fc, schedule, changes=changes)
+        check("installments+changes: schedule is safe once the change is applied", with_changes >= fc.minimum_balance - 1e-6)
+
+
 def test_installment_schedule_shapes():
     from src.payment_options import load_installment_options
     import pandas as pd
@@ -305,6 +334,7 @@ def main():
         test_verifier_independently_rejects_late_payment,
         test_spending_changes_capped_at_three,
         test_verifier_rejects_fabricated_installment_plan,
+        test_installments_combine_with_spending_changes,
         test_installment_schedule_shapes,
     ]:
         try:
