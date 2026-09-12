@@ -17,8 +17,9 @@ Design (see AGENTS.md / problem_statement.md for the source rules):
 """
 from __future__ import annotations
 
+import os
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from statistics import mean, median
 from typing import Callable, Dict, List, Optional
@@ -32,9 +33,10 @@ from .messages import (
     KIND_SALARY_ARREARS,
     KIND_SALARY_BASE_ONLY,
     KIND_SALARY_CONFIRMED,
-    KIND_SALARY_NEXT_AMOUNT,
     KIND_SALARY_NEXT_DATE,
+    KIND_SALARY_PERMANENT_RAISE,
     KIND_SALARY_STREAM_ENDED,
+    KIND_SALARY_TEMPORARY_AMOUNT,
     MessageFact,
     extract_all_facts,
     latest_salary_facts,
@@ -45,9 +47,8 @@ FORECAST_HORIZON_DAYS = 90
 RECURRENCE_MIN_OCCURRENCES = 3
 RECURRENCE_MAX_INTERVAL_DAYS = 45
 RECURRENCE_LOOKBACK_DAYS = 400  # ~13 months of history considered for pattern detection
-RECENT_WINDOW_FOR_AMOUNT = 10  # use at most this many most-recent occurrences for the amount estimate
+RECENT_WINDOW_FOR_AMOUNT = 6  # use at most this many most-recent occurrences for the amount estimate
 
-_ACTIVE_STATUSES_FORWARD_ANY = {"scheduled"}
 _IGNORED_STATUSES = {"cancelled", "failed", "unrealized"}
 
 
@@ -57,11 +58,6 @@ def _to_date(d) -> date:
     if isinstance(d, datetime):
         return d.date()
     return datetime.strptime(str(d)[:10], "%Y-%m-%d").date()
-
-
-def _signed_amount(row) -> float:
-    amt = float(row["amount"])
-    return amt if row["direction"] == "credit" else -amt
 
 
 @dataclass
@@ -84,6 +80,70 @@ def _add_months(d: date, months: int, target_day: Optional[int] = None) -> date:
     day = target_day or d.day
     day = min(day, _days_in_month(year, month))
     return date(year, month, day)
+
+
+_AMOUNT_ESTIMATOR = os.environ.get("BUYORWAIT_AMOUNT_ESTIMATOR", "mean")
+_EXPENSE_CONSERVATISM = float(os.environ.get("BUYORWAIT_EXPENSE_CONSERVATISM", "1.0"))
+
+
+def _estimate_amount(observations: List[float]) -> float:
+    """Point estimate for a recurring series' per-occurrence amount from its
+    recent observations. Strategy is selectable via BUYORWAIT_AMOUNT_ESTIMATOR
+    for controlled experimentation (see evaluation/ estimator sweep); default
+    is a plain recent-window mean."""
+    obs = sorted(observations)
+    n = len(obs)
+    strategy = _AMOUNT_ESTIMATOR
+    if strategy == "median":
+        return median(obs)
+    if strategy == "trimmed_mean" and n >= 4:
+        trimmed = obs[1:-1]
+        return mean(trimmed) if trimmed else mean(obs)
+    if strategy == "last":
+        return observations[-1]
+    if strategy == "weighted":
+        weights = list(range(1, len(observations) + 1))
+        return sum(o * w for o, w in zip(observations, weights)) / sum(weights)
+    return mean(obs)
+
+
+def _split_bimodal(grp: pd.DataFrame, all_amounts: dict):
+    """If the group's amounts cleanly separate into two clusters (e.g. two
+    concurrent household income earners under one "salary" category), return
+    (high_cluster_df, low_cluster_df) each sorted by date; else None.
+
+    Detection: sort amounts, find the single largest relative gap between
+    consecutive values, and require it to be a decisive separator (the low
+    side of the gap is at least ~1.5x smaller than the high side) with both
+    resulting clusters getting a fair, non-trivial share of the points --
+    otherwise this is just ordinary variance within one stream, not two
+    streams, and must not be split.
+    """
+    idx_amt = sorted(((i, all_amounts[i]) for i in grp.index), key=lambda t: t[1])
+    n = len(idx_amt)
+    if n < 4:
+        return None
+    best_gap_ratio = 0.0
+    best_split = None
+    for k in range(1, n):
+        lo_val = idx_amt[k - 1][1]
+        hi_val = idx_amt[k][1]
+        if lo_val <= 0:
+            continue
+        ratio = (hi_val - lo_val) / lo_val
+        # both sides must carry a reasonable share of the points -- a split
+        # that peels off a single outlier isn't "two streams", it's noise
+        # (already handled separately by the recent-median outlier filter).
+        if min(k, n - k) < max(2, n // 3):
+            continue
+        if ratio > best_gap_ratio:
+            best_gap_ratio = ratio
+            best_split = k
+    if best_split is None or best_gap_ratio < 0.15:
+        return None
+    low_idx = [i for i, _ in idx_amt[:best_split]]
+    high_idx = [i for i, _ in idx_amt[best_split:]]
+    return grp.loc[high_idx].sort_values("_date"), grp.loc[low_idx].sort_values("_date")
 
 
 def _step_forward(series: "RecurringSeries", d: date) -> date:
@@ -229,13 +289,6 @@ class EventEngine:
             last_description = str(grp.iloc[-1]["description"] or "").lower()
             if "final" in last_description:
                 continue
-            # Income needs fewer confirmed data points to establish a cadence:
-            # a brand-new job may only have a prorated first salary (settled)
-            # plus the next confirmed salary (scheduled) -- two points total.
-            is_income = bool(len(grp)) and grp.iloc[-1]["direction"] == "credit"
-            min_occurrences = 2 if is_income else RECURRENCE_MIN_OCCURRENCES
-            if len(grp) < min_occurrences:
-                continue
 
             all_amounts = {}
             for idx, row in grp.iterrows():
@@ -243,70 +296,116 @@ class EventEngine:
                 if home_amt is not None:
                     all_amounts[idx] = home_amt
             grp = grp.loc[[i for i in grp.index if i in all_amounts]]
-            if len(grp) < min_occurrences:
+            if grp.empty:
                 continue
-
-            # A category can mix a genuinely recurring stream (e.g. monthly
-            # "Payroll credit") with irregular one-off entries sharing the
-            # same category (a quarterly bonus, an arrears adjustment), or
-            # even a regime change (a raise, a new employer at a different
-            # rate). With enough data points, drop amount outliers -- more
-            # than 40% away from the *recent* median (so a sustained new
-            # level, not just the historically dominant one, wins) -- before
-            # fitting cadence/amount, so one odd entry can't distort it.
-            recent_tail_idx = list(grp.index)[-RECENT_WINDOW_FOR_AMOUNT:]
-            med_recent = median(all_amounts[i] for i in recent_tail_idx)
-            if len(grp) >= 4 and med_recent > 0:
-                core_idx = [i for i in grp.index if abs(all_amounts[i] - med_recent) <= 0.4 * med_recent]
-                if len(core_idx) >= min_occurrences:
-                    grp = grp.loc[core_idx]
-
-            dates = list(grp["_date"])
-            intervals = [(dates[i + 1] - dates[i]).days for i in range(len(dates) - 1)]
-            intervals = [i for i in intervals if i > 0]
-            if not intervals:
-                continue
-            avg_interval = mean(intervals)
-            if avg_interval > RECURRENCE_MAX_INTERVAL_DAYS:
-                continue
-
-            # Many monthly bills/salary in this dataset land on a fixed
-            # calendar day every month; prefer stepping by calendar months
-            # over a raw average day-count, which drifts by a day or two
-            # whenever a month's length or an outlier shifts the mean.
-            monthly_day = None
-            if 25 <= avg_interval <= 35 and len(dates) >= 2:
-                days_of_month = [d.day for d in dates]
-                mode_day = max(set(days_of_month), key=days_of_month.count)
-                consistent = sum(1 for d in days_of_month if abs(d - mode_day) <= 1)
-                if consistent >= max(2, int(0.7 * len(days_of_month))):
-                    monthly_day = mode_day
-
-            recent_idx = list(grp.index)[-RECENT_WINDOW_FOR_AMOUNT:]
-            home_amounts = [all_amounts[i] for i in recent_idx]
             is_credit = grp.iloc[-1]["direction"] == "credit"
+            min_occurrences = 2 if is_credit else RECURRENCE_MIN_OCCURRENCES
 
-            mean_amt, med_amt = mean(home_amounts), median(home_amounts)
-            # Conservative bias: assume slightly less income, slightly more expense.
-            conservative = mean_amt
-            signed_amount = conservative if is_credit else -conservative
+            # Some categories (documented in this dataset as e.g. "household
+            # income" with a "Primary household salary" + a "Second household
+            # income" earner) genuinely combine two concurrent, independently
+            # recurring streams under one category. A single blended fit
+            # mis-estimates both the cadence and the amount. Detect this via
+            # the simplest defensible signal -- a single large, consistent
+            # relative gap splitting the recent amounts into two clusters --
+            # and fit each cluster as its own series when both sides
+            # independently clear the occurrence/cadence bar.
+            primary = self._fit_series_from_group(grp, all_amounts, category, min_occurrences, is_credit)
+            secondary = None
+            if is_credit and len(grp) >= 2 * min_occurrences:
+                split = _split_bimodal(grp, all_amounts)
+                if split is not None:
+                    grp_hi, grp_lo = split
+                    fit_hi = self._fit_series_from_group(grp_hi, all_amounts, category, min_occurrences, is_credit)
+                    fit_lo = self._fit_series_from_group(grp_lo, all_amounts, category, min_occurrences, is_credit)
+                    if fit_hi is not None and fit_lo is not None:
+                        primary, secondary = fit_hi, fit_lo
 
-            last_row = grp.iloc[-1]
-            result[category] = RecurringSeries(
-                category=category,
-                interval_days=max(1, round(avg_interval)),
-                amount=signed_amount,
-                last_date=dates[-1],
-                anchor_event_id=last_row["event_id"],
-                flexibility=last_row["flexibility"] if not pd.isna(last_row["flexibility"]) else "fixed",
-                minimum_allowed_amount=(
-                    float(last_row["minimum_allowed_amount"])
-                    if not pd.isna(last_row["minimum_allowed_amount"])
-                    else None
-                ),
-                monthly_day=monthly_day,
-            )
+            if primary is not None:
+                result[category] = primary
+            if secondary is not None:
+                result[f"{category}~2"] = secondary
         return result
+
+    def _fit_series_from_group(
+        self, grp: pd.DataFrame, all_amounts: dict, category: str, min_occurrences: int, is_credit: bool
+    ) -> Optional[RecurringSeries]:
+        if len(grp) < min_occurrences:
+            return None
+
+        # A category can mix a genuinely recurring stream (e.g. monthly
+        # "Payroll credit") with irregular one-off entries sharing the same
+        # category (a quarterly bonus, an arrears adjustment), or even a
+        # regime change (a raise, a new employer at a different rate). With
+        # enough data points, drop amount outliers -- more than 30% away
+        # from the *recent* median (so a sustained new level, not just the
+        # historically dominant one, wins) -- before fitting cadence/amount,
+        # so one odd entry can't distort it.
+        recent_tail_idx = list(grp.index)[-RECENT_WINDOW_FOR_AMOUNT:]
+        med_recent = median(all_amounts[i] for i in recent_tail_idx)
+        if len(grp) >= 4 and med_recent > 0:
+            core_idx = [i for i in grp.index if abs(all_amounts[i] - med_recent) <= 0.3 * med_recent]
+            if len(core_idx) >= min_occurrences:
+                grp = grp.loc[core_idx]
+
+        dates = list(grp["_date"])
+
+        # A single stray point that survives the amount-outlier filter (its
+        # amount happens to be close enough to the recurring level) can still
+        # corrupt the cadence: e.g. one commission payment landing near a
+        # base-salary amount, dated mid-month, drags the average interval
+        # away from the true ~30-day monthly rhythm the other points clearly
+        # share. When a large majority of points agree on the same
+        # day-of-month, drop the minority before computing intervals --
+        # mirroring the amount-outlier filter above, but for the date axis.
+        if len(dates) >= 4:
+            days_of_month = [d.day for d in dates]
+            mode_day = max(set(days_of_month), key=days_of_month.count)
+            keep = [i for i, d in enumerate(days_of_month) if abs(d - mode_day) <= 1]
+            if len(keep) >= max(min_occurrences, int(0.7 * len(dates))) and len(keep) < len(dates):
+                grp = grp.iloc[keep]
+                dates = list(grp["_date"])
+
+        intervals = [(dates[i + 1] - dates[i]).days for i in range(len(dates) - 1)]
+        intervals = [i for i in intervals if i > 0]
+        if not intervals:
+            return None
+        avg_interval = mean(intervals)
+        if avg_interval > RECURRENCE_MAX_INTERVAL_DAYS:
+            return None
+
+        # Many monthly bills/salary in this dataset land on a fixed calendar
+        # day every month; prefer stepping by calendar months over a raw
+        # average day-count, which drifts by a day or two whenever a month's
+        # length shifts the mean.
+        monthly_day = None
+        if 25 <= avg_interval <= 35 and len(dates) >= 2:
+            days_of_month = [d.day for d in dates]
+            mode_day = max(set(days_of_month), key=days_of_month.count)
+            consistent = sum(1 for d in days_of_month if abs(d - mode_day) <= 1)
+            if consistent >= max(2, int(0.7 * len(days_of_month))):
+                monthly_day = mode_day
+
+        recent_idx = list(grp.index)[-RECENT_WINDOW_FOR_AMOUNT:]
+        home_amounts = [all_amounts[i] for i in recent_idx]
+        estimate = _estimate_amount(home_amounts)
+        if not is_credit:
+            estimate *= _EXPENSE_CONSERVATISM
+        signed_amount = estimate if is_credit else -estimate
+
+        last_row = grp.iloc[-1]
+        return RecurringSeries(
+            category=category,
+            interval_days=max(1, round(avg_interval)),
+            amount=signed_amount,
+            last_date=dates[-1],
+            anchor_event_id=last_row["event_id"],
+            flexibility=last_row["flexibility"] if not pd.isna(last_row["flexibility"]) else "fixed",
+            minimum_allowed_amount=(
+                float(last_row["minimum_allowed_amount"]) if not pd.isna(last_row["minimum_allowed_amount"]) else None
+            ),
+            monthly_day=monthly_day,
+        )
 
     # -- message-derived amendments to the "salary" series --------------------
     def _apply_income_message_facts(
@@ -352,9 +451,47 @@ class EventEngine:
                     active=True,
                 )
                 series = series_by_category["salary"]
-            elif fact.kind in (KIND_SALARY_NEXT_AMOUNT, KIND_SALARY_BASE_ONLY) and series is not None:
+            elif fact.kind == KIND_SALARY_BASE_ONLY and series is not None:
                 if amount_home is not None:
                     series.amount = amount_home
+                # "One household employment record has ended. The remaining
+                # confirmed monthly salary is X" replaces the combined total
+                # with a single figure -- if a second concurrent income
+                # stream had been detected (see _split_bimodal), it must not
+                # keep being projected on top of this restated total.
+                secondary = series_by_category.get("salary~2")
+                if secondary is not None:
+                    secondary.active = False
+            elif fact.kind == KIND_SALARY_PERMANENT_RAISE and series is not None:
+                # Ongoing change effective from a stated date -- unlike the
+                # temporary-dip patterns below, this permanently overwrites
+                # the baseline amount for every future occurrence.
+                if amount_home is not None:
+                    series.amount = amount_home
+                if fact.effective_date:
+                    series.last_date = fact.effective_date - timedelta(days=series.interval_days)
+                    series.monthly_day = fact.effective_date.day
+            elif fact.kind == KIND_SALARY_TEMPORARY_AMOUNT and series is not None:
+                # Affects ONLY the single next occurrence (unpaid leave, one
+                # affected pay cycle), then the series must revert to its
+                # normal baseline amount -- so we inject a one-off item for
+                # just that cycle and advance last_date past it, without
+                # touching series.amount.
+                if amount_home is not None:
+                    next_date = _step_forward(series, series.last_date)
+                    if request_date <= next_date:
+                        pending_arrears.append(
+                            ForecastItem(
+                                date=next_date,
+                                amount=amount_home,
+                                category="salary",
+                                series_key="event:salary",
+                                source="explicit",
+                                event_id=None,
+                                anchor_event_id=series.anchor_event_id,
+                            )
+                        )
+                    series.last_date = next_date
             elif fact.kind == KIND_SALARY_NEXT_DATE and series is not None and fact.effective_date:
                 series.last_date = fact.effective_date - timedelta(days=series.interval_days)
                 series.monthly_day = fact.effective_date.day
@@ -424,28 +561,41 @@ class EventEngine:
         horizon_end: date,
         forward_explicit: List[ForecastItem],
     ) -> List[ForecastItem]:
-        explicit_by_category: Dict[str, List[date]] = defaultdict(list)
+        explicit_by_category: Dict[str, List[tuple]] = defaultdict(list)
         for item in forward_explicit:
-            explicit_by_category[item.category].append(item.date)
+            explicit_by_category[item.category].append((item.date, item.amount))
 
         projected: List[ForecastItem] = []
-        for category, series in series_by_category.items():
+        for series_dict_key, series in series_by_category.items():
             if not series.active:
                 continue
+            category = series.category
             can_stop, can_reduce = self._series_actions(series)
             next_date = _step_forward(series, series.last_date)
-            explicit_dates = explicit_by_category.get(category, [])
+            explicit_points = explicit_by_category.get(category, [])
             n = 0
             while next_date <= horizon_end and n < 400:
                 if next_date >= request_date:
-                    near_explicit = any(abs((next_date - d).days) <= max(3, series.interval_days // 2) for d in explicit_dates)
+                    # Only treat an explicit forward-dated event as "this is
+                    # the same occurrence" (and skip generating a duplicate
+                    # projected one) when it is close in BOTH date and
+                    # amount -- a same-category explicit event with a wildly
+                    # different amount (e.g. a one-off pending purchase vs. a
+                    # recurring subscription) is a genuinely separate cash
+                    # event and must not be silently dropped.
+                    window = max(3, series.interval_days // 2)
+                    near_explicit = any(
+                        abs((next_date - d).days) <= window
+                        and abs(abs(amt) - abs(series.amount)) <= 0.4 * max(abs(series.amount), 1.0)
+                        for d, amt in explicit_points
+                    )
                     if not near_explicit:
                         projected.append(
                             ForecastItem(
                                 date=next_date,
                                 amount=series.amount,
                                 category=category,
-                                series_key=f"series:{category}",
+                                series_key=f"series:{series_dict_key}",
                                 source="projected",
                                 event_id=None,
                                 can_stop=can_stop,
@@ -477,7 +627,8 @@ class EventEngine:
         willing_stop = _split(profile.get("expense_categories_user_is_willing_to_stop"))
 
         options: List[SpendingChangeOption] = []
-        for category, series in series_by_category.items():
+        for series_dict_key, series in series_by_category.items():
+            category = series.category
             if category in protect or not series.active:
                 continue
             occurrences = _count_occurrences(series, request_date, horizon_end)
@@ -488,7 +639,7 @@ class EventEngine:
                 savings = abs(series.amount) * occurrences
                 options.append(
                     SpendingChangeOption(
-                        series_key=f"series:{category}",
+                        series_key=f"series:{series_dict_key}",
                         category=category,
                         anchor_event_id=series.anchor_event_id,
                         action="stop",
@@ -501,7 +652,7 @@ class EventEngine:
                 if per_occurrence_savings > 0:
                     options.append(
                         SpendingChangeOption(
-                            series_key=f"series:{category}",
+                            series_key=f"series:{series_dict_key}",
                             category=category,
                             anchor_event_id=series.anchor_event_id,
                             action="reduce_to",

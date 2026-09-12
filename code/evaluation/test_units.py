@@ -160,6 +160,134 @@ def test_ninety_day_boundary():
     check("90_day_boundary: day-90 debit lowers the min balance", traj.min_over_window() == 600.0)
 
 
+def test_day_91_excluded():
+    from datetime import timedelta
+
+    fc = make_forecast(1000.0, 500.0, [ForecastItem(date(2026, 1, 1) + timedelta(days=91), -400.0, "rent", "s", "projected")])
+    traj = build_trajectory(fc)
+    check("day_91: an event one day past the horizon has no effect on the window", traj.min_over_window() == 1000.0)
+
+
+def test_balance_boundary_minimum_plus_one():
+    fc = make_forecast(1001.0, 1000.0, [])
+    check("balance_boundary: minimum+1 yields exactly 1 safe", amount_safe_to_pay(fc, 500.0) == 1.0)
+    fc_below = make_forecast(999.0, 1000.0, [])
+    check("balance_boundary: already below minimum yields 0 safe (never negative)", amount_safe_to_pay(fc_below, 500.0) == 0.0)
+
+
+def test_verifier_independently_rejects_late_payment():
+    # The verifier must not simply trust a plan handed to it -- construct one
+    # by hand whose only payment lands one day after desired_completion_date
+    # and confirm verify() flags it on its own, for every method except wait.
+    from src.planner import PlanResult
+    from src.verifier import verify
+
+    fc = make_forecast(2000.0, 500.0, [])
+    late_date = date(2026, 3, 1)
+    deadline = date(2026, 2, 28)
+    bad_plan = PlanResult(
+        status="affordable_with_plan", method="full_payment", amount_safe_to_pay=1000.0,
+        earliest_date_for_full_payment=late_date, payments=[(late_date, 1000.0)], changes=[],
+    )
+    ok, problems = verify(fc, 1000.0, bad_plan, desired_completion_date=deadline)
+    check("verifier: independently rejects a full_payment plan finishing after the deadline", not ok)
+
+    # The same late date is fine for `wait`, which is exempt by definition.
+    wait_plan = PlanResult(
+        status="affordable_later", method="wait", amount_safe_to_pay=0.0,
+        earliest_date_for_full_payment=late_date, payments=[(late_date, 1000.0)], changes=[],
+    )
+    ok2, _ = verify(fc, 1000.0, wait_plan, desired_completion_date=deadline)
+    check("verifier: `wait` is exempt from the deadline check", ok2)
+
+    # And a payment exactly on the deadline must be accepted, not rejected.
+    on_time_plan = PlanResult(
+        status="affordable_with_plan", method="full_payment", amount_safe_to_pay=1000.0,
+        earliest_date_for_full_payment=deadline, payments=[(deadline, 1000.0)], changes=[],
+    )
+    ok3, problems3 = verify(fc, 1000.0, on_time_plan, desired_completion_date=deadline)
+    check("verifier: a payment exactly on the deadline is accepted", ok3)
+
+
+def test_spending_changes_capped_at_three():
+    from src.spending_changes import find_minimal_changes, MAX_CHANGES
+
+    # Five tiny flexible categories, none alone (nor any pair/triple) enough
+    # to close the gap -- find_minimal_changes must never return more than
+    # MAX_CHANGES options even though closing the gap would need all five.
+    items = [
+        ForecastItem(date(2026, 1, 10), -100.0, f"cat{i}", f"series:cat{i}", "projected", can_reduce=False, can_stop=True, anchor_event_id=f"event_{i}")
+        for i in range(5)
+    ]
+    fc = UserForecast(
+        user_id="test", request_date=date(2026, 1, 1), horizon_end=date(2026, 1, 1) + __import__("datetime").timedelta(days=90),
+        home_currency="USD", starting_balance=1450.0, minimum_balance=1000.0, items=items,
+        change_options=[SpendingChangeOption(f"series:cat{i}", f"cat{i}", f"event_{i}", "stop", None, 100.0) for i in range(5)],
+    )
+    # Need 450 freed to safely pay 900 today (1450 - 900 = 550 < 1000); each
+    # category only frees 100, so 3 changes (300) is the max allowed and is
+    # still not enough -- this must return None, never a 4- or 5-change combo.
+    result = find_minimal_changes(fc, 900.0, fc.request_date)
+    check("spending_changes: never exceeds the 3-change cap even if more would help", result is None or len(result) <= MAX_CHANGES)
+
+
+def test_verifier_rejects_fabricated_installment_plan():
+    # The verifier must not simply trust that the planner only ever emits
+    # installment schedules taken from request_payment_options.csv -- feed it
+    # a plan with a schedule that does NOT match any supplied option and
+    # confirm it is independently caught.
+    from src.planner import PlanResult
+    from src.verifier import verify
+    import pandas as pd
+
+    fc = make_forecast(5000.0, 500.0, [])
+    options_df = pd.DataFrame([
+        {"payment_option_id": "po1", "request_id": "r1", "payment_method": "installments", "payment_amount": 500.0,
+         "number_of_payments": 2, "first_payment_date": "2026-01-05", "payment_frequency_days": 30,
+         "financing_fee": 10.0, "total_payable_amount": 1010.0},
+    ])
+    # A schedule with a different amount than the one real option offers
+    # (well outside rounding tolerance, not just off by a cent).
+    fabricated = PlanResult(
+        status="affordable_with_plan", method="installments", amount_safe_to_pay=0.0,
+        earliest_date_for_full_payment=None,
+        payments=[(date(2026, 1, 5), 300.0), (date(2026, 2, 4), 300.0)], changes=[],
+    )
+    ok, problems = verify(fc, 600.0, fabricated, options_df=options_df)
+    check("verifier: rejects an installment schedule that matches no supplied option", not ok)
+
+    genuine = PlanResult(
+        status="affordable_with_plan", method="installments", amount_safe_to_pay=0.0,
+        earliest_date_for_full_payment=None,
+        payments=[(date(2026, 1, 5), 500.0), (date(2026, 2, 4), 500.0)], changes=[],
+    )
+    ok2, problems2 = verify(fc, 1000.0, genuine, options_df=options_df)
+    check(f"verifier: accepts an installment schedule that matches a supplied option ({problems2})", ok2)
+
+
+def test_installment_schedule_shapes():
+    from src.payment_options import load_installment_options
+    import pandas as pd
+
+    rows = pd.DataFrame([
+        {"payment_option_id": "po1", "request_id": "r1", "payment_method": "installments", "payment_amount": 500.0,
+         "number_of_payments": 1, "first_payment_date": "2026-01-05", "payment_frequency_days": None,
+         "financing_fee": 0.0, "total_payable_amount": 500.0},
+        {"payment_option_id": "po2", "request_id": "r1", "payment_method": "installments", "payment_amount": 250.0,
+         "number_of_payments": 2, "first_payment_date": "2026-01-05", "payment_frequency_days": 30,
+         "financing_fee": 10.0, "total_payable_amount": 510.0},
+        {"payment_option_id": "po3", "request_id": "r1", "payment_method": "installments", "payment_amount": 175.0,
+         "number_of_payments": 3, "first_payment_date": "2026-01-05", "payment_frequency_days": 30,
+         "financing_fee": 25.0, "total_payable_amount": 525.0},
+    ])
+    opts = {o.payment_option_id: o for o in load_installment_options(rows)}
+    check("installments: 1-payment schedule has exactly 1 entry", len(opts["po1"].schedule) == 1)
+    check("installments: 2-payment schedule has exactly 2 entries, 30 days apart",
+          len(opts["po2"].schedule) == 2 and (opts["po2"].schedule[1][0] - opts["po2"].schedule[0][0]).days == 30)
+    check("installments: 3-payment schedule has exactly 3 entries", len(opts["po3"].schedule) == 3)
+    check("installments: last_payment_date matches the final scheduled entry", opts["po3"].last_payment_date == opts["po3"].schedule[-1][0])
+
+
 def main():
     for fn in [
         test_zero_safe_amount,
@@ -172,6 +300,12 @@ def main():
         test_pending_credit_ignored_pending_debit_reserved,
         test_spending_change_stop_vs_reduce,
         test_ninety_day_boundary,
+        test_day_91_excluded,
+        test_balance_boundary_minimum_plus_one,
+        test_verifier_independently_rejects_late_payment,
+        test_spending_changes_capped_at_three,
+        test_verifier_rejects_fabricated_installment_plan,
+        test_installment_schedule_shapes,
     ]:
         try:
             fn()

@@ -81,6 +81,16 @@ def _accepted_methods(profile: pd.Series) -> set:
 
 
 def _installment_duration_months(opt: InstallmentOption) -> float:
+    # `max_installment_months` in financial_profiles.csv is always a whole
+    # number (2-12), and every installment option in this dataset pays
+    # monthly (payment_frequency_days is 28-31 for all of them) -- the
+    # natural reading of "X installment months" is "X separate monthly
+    # payments", i.e. number_of_payments itself. Using the payment span in
+    # days (last - first) / 30 instead undercounts by one payment (e.g. 3
+    # monthly payments span only ~60 days = "2 months"), which would wrongly
+    # admit a 3-payment plan for a user who capped it at 2 monthly payments.
+    if 25 <= opt.frequency_days <= 35:
+        return float(opt.number_of_payments)
     span_days = (opt.last_payment_date - opt.first_payment_date).days
     return span_days / 30.0
 
@@ -152,6 +162,13 @@ def build_plan(
     # 5. Wait: full payment later, no changes.
     if "full_payment" in accepted and base_earliest_date is not None:
         candidates.append(Candidate("wait", TIER_LATER, [(base_earliest_date, requested_amount)]))
+
+    # "The plan must complete the request by desired_completion_date and keep
+    # the user above their minimum balance throughout the 90-day forecast"
+    # (90-Day Safety Check) makes deadline compliance part of what counts as
+    # *safe*, not merely a ranking tiebreaker, for every method except
+    # `wait` (which is definitionally the fallback for "not yet, but later").
+    candidates = [c for c in candidates if c.method == "wait" or c.meets_deadline(desired_completion_date)]
 
     if not candidates:
         return PlanResult(

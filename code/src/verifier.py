@@ -5,14 +5,24 @@ shipping a rule-violating row.
 """
 from __future__ import annotations
 
-from typing import List, Tuple
+from datetime import date
+from typing import List, Optional, Tuple
+
+import pandas as pd
 
 from .events import UserForecast
+from .payment_options import load_installment_options
 from .planner import PlanResult
 from .simulator import build_trajectory
 
 
-def verify(forecast: UserForecast, requested_amount: float, plan: PlanResult) -> Tuple[bool, List[str]]:
+def verify(
+    forecast: UserForecast,
+    requested_amount: float,
+    plan: PlanResult,
+    desired_completion_date: Optional[date] = None,
+    options_df: Optional[pd.DataFrame] = None,
+) -> Tuple[bool, List[str]]:
     problems: List[str] = []
 
     if not (0 - 1e-6 <= plan.amount_safe_to_pay <= requested_amount + 1e-6):
@@ -38,6 +48,39 @@ def verify(forecast: UserForecast, requested_amount: float, plan: PlanResult) ->
     dates_sorted = sorted(d for d, _ in plan.payments)
     if dates_sorted != [d for d, _ in plan.payments]:
         problems.append("payments not in chronological order")
+
+    if len(plan.changes) > 3:
+        problems.append(f"more than 3 spending changes ({len(plan.changes)})")
+    changed_events = [c.anchor_event_id for c in plan.changes]
+    if len(changed_events) != len(set(changed_events)):
+        problems.append("stop and reduce_to both target the same event (must be mutually exclusive)")
+
+    # "The plan must complete the request by desired_completion_date" is part
+    # of what makes a plan safe (90-Day Safety Check), for every method
+    # except `wait` -- which is definitionally the "not yet, but later" case.
+    if desired_completion_date is not None and plan.method != "wait" and dates_sorted:
+        if dates_sorted[-1] > desired_completion_date:
+            problems.append(
+                f"last payment {dates_sorted[-1]} is after desired_completion_date {desired_completion_date}"
+            )
+
+    # Installment plans must exactly match a *supplied* payment option --
+    # don't just trust that the planner only ever builds them that way;
+    # independently re-check against request_payment_options.csv.
+    if plan.method == "installments":
+        if options_df is None:
+            problems.append("installments plan cannot be verified: no payment options supplied")
+        else:
+            matched = any(
+                len(plan.payments) == len(opt.schedule)
+                and all(
+                    d == sched_d and abs(amt - sched_amt) <= 0.02 * max(1.0, sched_amt)
+                    for (d, amt), (sched_d, sched_amt) in zip(plan.payments, opt.schedule)
+                )
+                for opt in load_installment_options(options_df)
+            )
+            if not matched:
+                problems.append("installments plan does not exactly match any supplied payment option")
 
     extra = [(d, -amt) for d, amt in plan.payments]
     full_traj = build_trajectory(forecast, changes=plan.changes, extra_payments=extra)

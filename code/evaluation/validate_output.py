@@ -99,6 +99,8 @@ def main() -> int:
                     fail(f"{rid}: partial_payment must have exactly 2 payments: {plan}", errors)
                 elif abs(total - requested_amount) > 0.02:
                     fail(f"{rid}: partial_payment total {total} != requested {requested_amount}", errors)
+            if method == "full_payment" and abs(total - requested_amount) > 0.02:
+                fail(f"{rid}: full_payment total {total} != requested {requested_amount}", errors)
             if method in ("full_payment", "partial_payment") and dates:
                 if dates[-1] > desired_completion and row["affordability_status"] != "affordable_later":
                     fail(f"{rid}: last payment {dates[-1]} after deadline {desired_completion}", errors)
@@ -120,9 +122,24 @@ def main() -> int:
             parts = changes.split("|")
             if len(parts) > 3:
                 fail(f"{rid}: more than 3 spending changes: {changes}", errors)
+            changed_event_ids = []
             for p in parts:
-                if not (p.startswith("stop:") or p.startswith("reduce_to:")):
+                if p.startswith("stop:"):
+                    changed_event_ids.append(p.split(":", 1)[1])
+                elif p.startswith("reduce_to:"):
+                    segs = p.split(":")
+                    if len(segs) != 3:
+                        fail(f"{rid}: malformed reduce_to entry (expected event_id:amount) {p!r}", errors)
+                    else:
+                        try:
+                            float(segs[2])
+                        except ValueError:
+                            fail(f"{rid}: reduce_to amount not numeric: {p!r}", errors)
+                    changed_event_ids.append(segs[1] if len(segs) >= 2 else p)
+                else:
                     fail(f"{rid}: malformed spending change {p!r}", errors)
+            if len(changed_event_ids) != len(set(changed_event_ids)):
+                fail(f"{rid}: stop and reduce_to target the same event (must be mutually exclusive): {changes}", errors)
 
         if row["recommended_payment_method"] == "installments" and plan != "none":
             rid_opts = opts_by_request.get(rid)

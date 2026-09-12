@@ -3,6 +3,7 @@ one output.csv row.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 
 import pandas as pd
@@ -14,6 +15,10 @@ from .explain import build_explanation
 from .images import extract_amount as ocr_extract_amount
 from .planner import PlanResult, build_plan
 from .verifier import verify
+
+
+def _to_date(s):
+    return datetime.strptime(str(s)[:10], "%Y-%m-%d").date()
 
 REQUIRED_COLUMNS = [
     "request_id",
@@ -90,13 +95,18 @@ class Pipeline:
         requested_amount = round(float(request["requested_amount"]), 2)
         plan = build_plan(forecast, request, profile, options_df)
 
-        ok, problems = verify(forecast, requested_amount, plan)
+        ok, problems = verify(
+            forecast, requested_amount, plan, _to_date(request["desired_completion_date"]), options_df
+        )
         if not ok:
+            # earliest_date_for_full_payment is computed independently of the
+            # chosen method/plan (see planner.py) -- a verification failure on
+            # the *chosen* plan doesn't invalidate that independent figure.
             plan = PlanResult(
                 status="not_affordable",
                 method="not_recommended",
                 amount_safe_to_pay=plan.amount_safe_to_pay,
-                earliest_date_for_full_payment=None,
+                earliest_date_for_full_payment=plan.earliest_date_for_full_payment,
                 payments=[],
                 changes=[],
             )

@@ -108,6 +108,37 @@ code/
   `stop:`/`reduce_to:` references are always that user's latest occurrence
   of the category) and reduce to exactly `minimum_allowed_amount` when
   reducing, matching the supplied sample outputs.
+- **Deadline compliance is a hard eligibility gate, not just a ranking
+  preference**, for every method except `wait`: "the plan must complete the
+  request by desired_completion_date" (90-Day Safety Check) is part of what
+  makes a candidate plan *safe*, so a full-payment/partial/installment
+  candidate that finishes after the deadline is discarded before ranking
+  begins, rather than merely ranked last. This is enforced in both
+  `planner.py` and, independently, `verifier.py`.
+- **An explicit forward-dated event only dedupes against a recurring
+  projection when its amount is also close** (not just its date) -- two
+  events sharing a category (e.g. a one-off pending "shopping" debit and an
+  unrelated recurring "shopping" pattern) are genuinely different cash
+  events and must both be counted. Matching on date-proximity alone silently
+  dropped real, often large, pending debits.
+- **A category can hold two concurrent recurring streams** (this dataset
+  explicitly models "primary" + "second household income" earners under one
+  `salary` category). When a category's recent amounts split into two
+  well-separated, evenly-sized clusters, each cluster is fit as its own
+  independent series and summed, instead of one blended (and therefore
+  wrong-cadence, wrong-amount) series.
+- **`max_installment_months` counts monthly *payments*, not payment span in
+  days.** Every installment option in this dataset pays roughly monthly, and
+  profile values are whole numbers (2-12); a 3-payment plan is "3 months",
+  not `(last_payment - first_payment) / 30 ≈ 2` months.
+- **A day-of-month consistency pass runs alongside the amount-outlier
+  filter.** A stray point can pass the amount-outlier band (close enough in
+  magnitude) yet still land on the wrong day of the month -- e.g. one
+  commission payment whose amount happens to be close to a base salary --
+  and that single date corrupts the average interval enough to miss the
+  monthly-day detection entirely. When a large majority of points share a
+  day-of-month, the minority is dropped before fitting cadence, mirroring
+  the amount-outlier filter but on the date axis.
 
 ## Known limitations
 
@@ -115,7 +146,16 @@ code/
   with outlier filtering); they will not exactly reproduce a hidden
   ground-truth generator's precise formula, so `amount_safe_to_pay` should be
   read as "close" rather than bit-exact -- validated against
-  `dataset/sample_requests.csv` via `test_solver.py`.
+  `dataset/sample_requests.csv` via `test_solver.py`. A dedicated audit
+  (`evaluation/estimator_sweep.py`) tested median/trimmed-mean/weighted/
+  latest-observation estimators and a systematic expense-conservatism bias
+  against all 25 public samples: no alternative estimator improved on a
+  plain recent-window mean, and any conservatism bias strong enough to move
+  the average error traded categorical accuracy away (regressions on
+  `recommended_payment_method`/`payment_plan` that got worse the more bias
+  was applied) rather than fixing it -- the remaining gap is consistent with
+  per-request noise in an unobservable synthetic-generation formula, not a
+  further fixable estimator choice.
 - OCR-based image amount extraction is best-effort; it resolves the intended
   figure cleanly on most of the 16 linked images but is unreliable on
   handwritten receipts (no vision model is available in this environment).

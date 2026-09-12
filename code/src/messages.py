@@ -7,7 +7,7 @@ present in this dataset); embedded instructions in the text are never
 executed, only currency/amount/date facts are pulled out.
 
 Extracted facts feed src/events.py as overrides on top of the
-recurrence-detected forecast (see build_income_facts / build_event_facts).
+recurrence-detected forecast (see EventEngine._apply_income_message_facts).
 """
 from __future__ import annotations
 
@@ -50,7 +50,8 @@ class MessageFact:
 
 
 # income-stream facts (applied to the user's recurring "salary" category)
-KIND_SALARY_NEXT_AMOUNT = "salary_next_amount"       # next occurrence amount changes (temporary/reduced)
+KIND_SALARY_TEMPORARY_AMOUNT = "salary_temporary_amount"  # ONE occurrence only, then reverts (leave, one-off dip)
+KIND_SALARY_PERMANENT_RAISE = "salary_permanent_raise"     # ongoing change, effective from a given date
 KIND_SALARY_NEXT_DATE = "salary_next_date"            # next occurrence date changes
 KIND_SALARY_CONFIRMED = "salary_confirmed"            # one-time confirmed amount on a specific date, recurring from there
 KIND_SALARY_BASE_ONLY = "salary_base_only"            # confirmed base amount; variable component excluded
@@ -62,16 +63,20 @@ KIND_CONFIRMED_ONE_OFF_INCOME = "confirmed_one_off_income"
 
 _EMPLOYER_PATTERNS: List[tuple] = [
     # "Your first salary will be EUR 620. The confirmed credit date is 2026-07-15."
+    # / "...is scheduled for 2025-05-15." (both phrasings occur in the dataset)
     (
         re.compile(
-            r"first salary\D*" + AMOUNT_RE + r".*?(?:confirmed credit date is|confirmed for)\D*" + DATE_RE,
+            r"first salary\D*" + AMOUNT_RE
+            + r".*?(?:confirmed credit date is|confirmed for|is scheduled for)\D*" + DATE_RE,
             re.IGNORECASE | re.DOTALL,
         ),
         KIND_SALARY_CONFIRMED,
     ),
     (
         re.compile(
-            r"[Gg]aji pertama\D*" + AMOUNT_RE + r".*?(?:dikonfirmasi untuk|dijadwalkan pada)\D*" + DATE_RE,
+            r"[Gg]aji pertama\D*" + AMOUNT_RE
+            + r".*?(?:dikonfirmasi untuk|dijadwalkan pada|[Tt]anggal kredit yang dikonfirmasi adalah)\D*"
+            + DATE_RE,
             re.DOTALL,
         ),
         KIND_SALARY_CONFIRMED,
@@ -81,36 +86,64 @@ _EMPLOYER_PATTERNS: List[tuple] = [
         re.compile(r"salary of\s*" + AMOUNT_RE + r"\s*is confirmed for\D*" + DATE_RE, re.IGNORECASE),
         KIND_SALARY_CONFIRMED,
     ),
+    # "Gaji sebesar USD 696 dikonfirmasi untuk 2025-05-15."
+    (
+        re.compile(r"[Gg]aji sebesar\s*" + AMOUNT_RE + r"\s*dikonfirmasi untuk\D*" + DATE_RE),
+        KIND_SALARY_CONFIRMED,
+    ),
     # "Regular salary of INR 251000 resumes on 2026-01-15."
     (
         re.compile(r"[Rr]egular salary of\s*" + AMOUNT_RE + r"\s*resumes on\D*" + DATE_RE),
         KIND_SALARY_CONFIRMED,
     ),
-    # "Remaining confirmed monthly salary is IDR X" (Indonesian, income source ended)
+    # "Remaining confirmed monthly salary is IDR X" -- one household income
+    # source ended, the OTHER (still ongoing) source's amount is restated.
+    (
+        re.compile(r"[Rr]emaining confirmed monthly salary is\s*" + AMOUNT_RE),
+        KIND_SALARY_BASE_ONLY,
+    ),
     (
         re.compile(r"[Ss]isa gaji bulanan yang dikonfirmasi adalah\s*" + AMOUNT_RE),
         KIND_SALARY_BASE_ONLY,
     ),
-    # temporary / reduced pay continuing "for the next payroll"
+    # Ongoing/permanent raise, effective from a stated date -- applies to
+    # every future occurrence, unlike the "temporary" patterns below.
+    (
+        re.compile(
+            r"monthly salary has increased to\s*" + AMOUNT_RE + r".*?applies from\D*" + DATE_RE,
+            re.IGNORECASE | re.DOTALL,
+        ),
+        KIND_SALARY_PERMANENT_RAISE,
+    ),
+    (
+        re.compile(
+            r"[Gg]aji bulanan Anda naik menjadi\s*" + AMOUNT_RE + r".*?berlaku mulai\D*" + DATE_RE,
+            re.DOTALL,
+        ),
+        KIND_SALARY_PERMANENT_RAISE,
+    ),
+    # Temporary / one-off dip that reverts after a single payroll cycle --
+    # unpaid leave, a one-time reduced/affected pay cycle. Must NOT permanently
+    # overwrite the recurring baseline amount.
     (
         re.compile(r"temporary monthly pay is\s*" + AMOUNT_RE, re.IGNORECASE),
-        KIND_SALARY_NEXT_AMOUNT,
+        KIND_SALARY_TEMPORARY_AMOUNT,
     ),
     (
         re.compile(r"next salary is reduced to\s*" + AMOUNT_RE, re.IGNORECASE),
-        KIND_SALARY_NEXT_AMOUNT,
+        KIND_SALARY_TEMPORARY_AMOUNT,
     ),
     (
-        re.compile(r"monthly salary has increased to\s*" + AMOUNT_RE, re.IGNORECASE),
-        KIND_SALARY_NEXT_AMOUNT,
+        re.compile(r"[Gg]aji bulanan sementara Anda adalah\s*" + AMOUNT_RE),
+        KIND_SALARY_TEMPORARY_AMOUNT,
     ),
-    (
-        re.compile(r"[Gg]aji bulanan Anda naik menjadi\s*" + AMOUNT_RE),
-        KIND_SALARY_NEXT_AMOUNT,
-    ),
-    # "confirmed salary is now expected on DATE"
+    # "confirmed salary is now expected on DATE" (date-only amendment)
     (
         re.compile(r"confirmed salary is now expected on\D*" + DATE_RE, re.IGNORECASE),
+        KIND_SALARY_NEXT_DATE,
+    ),
+    (
+        re.compile(r"[Gg]aji yang sudah dikonfirmasi kini diperkirakan masuk pada\D*" + DATE_RE),
         KIND_SALARY_NEXT_DATE,
     ),
     # base salary confirmed, commission/bonus still pending -> count base only
@@ -146,6 +179,14 @@ _EMPLOYER_PATTERNS: List[tuple] = [
     ),
     (
         re.compile(r"seasonal contract has ended", re.IGNORECASE),
+        KIND_SALARY_STREAM_ENDED,
+    ),
+    (
+        re.compile(r"Hubungan kerja Anda telah berakhir"),
+        KIND_SALARY_STREAM_ENDED,
+    ),
+    (
+        re.compile(r"Kontrak musiman saat ini telah berakhir"),
         KIND_SALARY_STREAM_ENDED,
     ),
 ]
@@ -186,7 +227,7 @@ def extract_facts(message_row: pd.Series) -> List[MessageFact]:
                 facts.append(
                     MessageFact(mid, uid, kind, effective_date=_to_date(dt), sent_at=message_row.get("sent_at"))
                 )
-            elif kind in (KIND_SALARY_CONFIRMED,) and len(groups) == 3:
+            elif kind in (KIND_SALARY_CONFIRMED, KIND_SALARY_PERMANENT_RAISE) and len(groups) == 3:
                 cur, amt, dt = groups
                 facts.append(
                     MessageFact(
@@ -194,7 +235,7 @@ def extract_facts(message_row: pd.Series) -> List[MessageFact]:
                         effective_date=_to_date(dt), sent_at=message_row.get("sent_at"),
                     )
                 )
-            elif kind in (KIND_SALARY_NEXT_AMOUNT, KIND_SALARY_BASE_ONLY) and len(groups) == 2:
+            elif kind in (KIND_SALARY_TEMPORARY_AMOUNT, KIND_SALARY_BASE_ONLY) and len(groups) == 2:
                 cur, amt = groups
                 facts.append(
                     MessageFact(
@@ -230,8 +271,8 @@ def latest_salary_facts(facts: List[MessageFact]) -> List[MessageFact]:
     (newer records from the same source) win on conflicts, per the dataset's
     conflict-resolution priority."""
     salary_kinds = {
-        KIND_SALARY_NEXT_AMOUNT, KIND_SALARY_NEXT_DATE, KIND_SALARY_CONFIRMED,
-        KIND_SALARY_BASE_ONLY, KIND_SALARY_ARREARS, KIND_SALARY_STREAM_ENDED,
+        KIND_SALARY_TEMPORARY_AMOUNT, KIND_SALARY_PERMANENT_RAISE, KIND_SALARY_NEXT_DATE,
+        KIND_SALARY_CONFIRMED, KIND_SALARY_BASE_ONLY, KIND_SALARY_ARREARS, KIND_SALARY_STREAM_ENDED,
     }
     relevant = [f for f in facts if f.kind in salary_kinds]
     relevant.sort(key=lambda f: f.sent_at or "")

@@ -58,8 +58,10 @@ template-generated from the already-finalized, verified decision facts
 
 The only non-trivial local compute is Tesseract OCR over 16 PNG images (run once,
 cached) and the deterministic 90-day cash-flow simulation for each of the 250
-requests. The full run (`python code/main.py`) completes in ~25 seconds on a
-standard laptop CPU, with no GPU or paid API usage of any kind.
+requests. The full run (`python code/main.py`) completes in ~25-30 seconds on a
+standard laptop CPU, with no GPU or paid API usage of any kind. The pipeline is
+fully deterministic: re-running it on the same dataset reproduces byte-identical
+output.csv (verified).
 
 ## If an LLM were added later
 
